@@ -1,0 +1,294 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function currentUserDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    // NOTE: this performs an extra document read on every rule evaluation that
+    // checks isAdmin() (billed + adds latency). Acceptable at Phase-1/FYP scale.
+    // A later phase can switch to Firebase custom claims (set via a Cloud
+    // Function on approval) so rules check request.auth.token.role instead.
+    function isAdmin() {
+      return isSignedIn()
+        && currentUserDoc().data.role == 'ADMIN'
+        && currentUserDoc().data.status == 'APPROVED';
+    }
+
+    function isApprovedUser() {
+      return isSignedIn() && currentUserDoc().data.status == 'APPROVED';
+    }
+
+    match /users/{userId} {
+      // Owner, Admin, an approved HOD reading a user (e.g. a teacher) in
+      // their own department (HOD subject-assignment picker), or an approved
+      // Teacher reading a Student in their own department (attendance roster).
+      // A Teacher can now belong to several departments (`departmentIds`); the
+      // `department` equality check is kept alongside the `in` check so older
+      // Teacher docs that never wrote `departmentIds` still match.
+      allow read: if isOwner(userId) || isAdmin()
+        || (isApprovedUser() && currentUserDoc().data.role == 'HOD'
+            && resource.data.department == currentUserDoc().data.department)
+        || (isApprovedUser() && currentUserDoc().data.role == 'TEACHER'
+            && resource.data.role == 'STUDENT'
+            && (resource.data.department == currentUserDoc().data.department
+                || resource.data.department in currentUserDoc().data.get('departmentIds', [])));
+
+      // Self-registration only: role must be one of HOD/TEACHER/STUDENT
+      // (never ADMIN) and status must start as PENDING. Self-elevation is
+      // impossible because both fields are enforced here, not just in the app UI.
+      allow create: if isOwner(userId)
+        && request.resource.data.uid == userId
+        && request.resource.data.role in ['HOD', 'TEACHER', 'STUDENT']
+        && request.resource.data.status == 'PENDING'
+        && request.resource.data.email == request.auth.token.email;
+
+      // Admin can change anything (approve/reject/suspend/activate/edit).
+      // A non-admin owner may update their own doc but never role or status.
+      allow update: if isAdmin()
+        || (isOwner(userId)
+            && request.resource.data.role == resource.data.role
+            && request.resource.data.status == resource.data.status);
+
+      allow delete: if isAdmin();
+    }
+
+    // Reservation docs used to guarantee CNIC/phone uniqueness via a
+    // transaction at registration time (doc ID is the normalized value).
+    match /cnicIndex/{cnic} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    match /phoneIndex/{phone} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    // University structure (Department -> Semester -> Subject). Read is open
+    // to any approved user since HOD/Teacher/Student screens will read this
+    // data in later phases; writes are Admin-only (created/managed here in
+    // Phase 2's Admin "University Management" screens).
+    match /departments/{deptId} {
+      allow read: if isApprovedUser();
+      allow write: if isAdmin();
+    }
+
+    match /semesters/{semesterId} {
+      allow read: if isApprovedUser();
+      allow write: if isAdmin();
+    }
+
+    // Student cohort labels (e.g. "2022-2026"), scoped per department —
+    // same shape/rule as semesters, used by Admin's hierarchical Student
+    // Management (Phase: Hierarchical Admin User Management).
+    match /sessions/{sessionId} {
+      allow read: if isApprovedUser();
+      allow write: if isAdmin();
+    }
+
+    match /subjects/{subjectId} {
+      allow read: if isApprovedUser();
+      allow create, delete: if isAdmin();
+      // Admin can edit anything; an approved HOD can update (specifically:
+      // assign/unassign a teacher on) a subject only within their own
+      // department.
+      allow update: if isAdmin()
+        || (isApprovedUser() && currentUserDoc().data.role == 'HOD'
+            && currentUserDoc().data.department == resource.data.departmentId);
+    }
+
+    function isTeacherOfSubject(subjectId) {
+      return isApprovedUser()
+        && currentUserDoc().data.role == 'TEACHER'
+        && get(/databases/$(database)/documents/subjects/$(subjectId)).data.teacherUid == request.auth.uid;
+    }
+
+    // HOD monitoring/reporting screens (Phase 10) — department-scoped reads
+    // over otherwise-personal collections. isHodOfDepartment is used where a
+    // doc already stores departmentId directly (attendance); the *Subject*
+    // variant does the same cross-doc departmentId lookup isTeacherOfSubject
+    // already does, for docs that only store subjectId (submissions, quizAttempts).
+    function isHodOfDepartment(departmentId) {
+      return isApprovedUser() && currentUserDoc().data.role == 'HOD'
+        && currentUserDoc().data.department == departmentId;
+    }
+    function isHodOfSubjectDepartment(subjectId) {
+      return isApprovedUser() && currentUserDoc().data.role == 'HOD'
+        && get(/databases/$(database)/documents/subjects/$(subjectId)).data.departmentId == currentUserDoc().data.department;
+    }
+
+    // Personal data: unlike departments/semesters/subjects, NOT open to any
+    // approved user. A Student may only ever read their own records; a
+    // Teacher may only read/write records for subjects they are actually
+    // assigned to; an HOD may read (not write) records within their own
+    // department for monitoring/reports.
+    match /attendance/{recordId} {
+      allow read: if isAdmin()
+        || (isApprovedUser() && resource.data.studentUid == request.auth.uid)
+        || isTeacherOfSubject(resource.data.subjectId)
+        || isHodOfDepartment(resource.data.departmentId);
+
+      allow create, update: if isAdmin()
+        || (isTeacherOfSubject(request.resource.data.subjectId)
+            && request.resource.data.markedBy == request.auth.uid);
+
+      allow delete: if isAdmin();
+    }
+
+    // Nothing in the app edits an assignment, so update is left unwritten
+    // (default deny) — delete is Admin-only (monitor screen).
+    match /assignments/{assignmentId} {
+      allow read: if isApprovedUser();
+      allow create: if isAdmin() || isTeacherOfSubject(request.resource.data.subjectId);
+      allow delete: if isAdmin();
+    }
+
+    // One doc per (assignment, student) doubles as both "the student's
+    // submission content" and "the teacher's grade" — affectedKeys() is what
+    // lets each side write only their own fields without a separate
+    // collection: a Student can never set marksObtained/feedback/gradedBy/
+    // gradedAt (checked explicitly on create, and update only allows
+    // content-field changes for the student), and a Teacher's update is
+    // restricted to only the grade fields.
+    match /submissions/{submissionId} {
+      allow read: if isAdmin()
+        || (isApprovedUser() && resource.data.studentUid == request.auth.uid)
+        || isTeacherOfSubject(resource.data.subjectId)
+        || isHodOfSubjectDepartment(resource.data.subjectId);
+
+      allow create: if isApprovedUser()
+        && request.resource.data.studentUid == request.auth.uid
+        && request.resource.data.marksObtained == null;
+
+      allow update: if isAdmin()
+        || (isApprovedUser() && resource.data.studentUid == request.auth.uid
+            && request.resource.data.studentUid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['textAnswer', 'fileUrl', 'fileName', 'filePublicId', 'fileResourceType', 'fileSize', 'submittedAt']))
+        || (isTeacherOfSubject(resource.data.subjectId)
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['marksObtained', 'feedback', 'gradedAt', 'gradedBy']));
+    }
+
+    // No update/delete on quizzes — same "no rule for an operation no UI
+    // performs yet" reasoning as assignments above.
+    match /quizzes/{quizId} {
+      allow read: if isApprovedUser();
+      allow create: if isAdmin() || isTeacherOfSubject(request.resource.data.subjectId);
+    }
+
+    // Deterministic doc ID ({quizId}_{studentUid}) + no `update` rule at all
+    // is what makes an attempt final: a second .set() on the same doc is
+    // evaluated as an update by the rules engine, and with no update rule
+    // that's a default deny. Stronger than submissions' resubmit-until-graded
+    // model — there's no second writer here (grading is automatic, so the
+    // Teacher never writes to this collection). The due-date check blocks a
+    // late attempt server-side too, not just as client-side UX.
+    match /quizAttempts/{attemptId} {
+      allow read: if isAdmin()
+        || (isApprovedUser() && resource.data.studentUid == request.auth.uid)
+        || isTeacherOfSubject(resource.data.subjectId)
+        || isHodOfSubjectDepartment(resource.data.subjectId);
+
+      allow create: if isApprovedUser()
+        && request.resource.data.studentUid == request.auth.uid
+        && get(/databases/$(database)/documents/quizzes/$(request.resource.data.quizId)).data.dueDateMillis
+             > request.time.toMillis();
+
+      // Manual Exam grading (Phase 11) — a Teacher may override the
+      // auto-computed score for an Exam-type attempt, restricted to the
+      // same grading fields as submissions' GradeDialog.
+      allow update: if isTeacherOfSubject(resource.data.subjectId)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['manualScore', 'feedback', 'gradedAt', 'gradedBy']);
+    }
+
+    // Read is open to any approved user (audience scoping — ALL/DEPARTMENT/
+    // SUBJECT — is a client-side display concern, not a security boundary;
+    // an announcement isn't sensitive data, unlike attendance/submissions).
+    // Create is role-scoped: Admin posts anything, HOD only as themselves
+    // for their own department, Teacher only for a subject they teach.
+    match /announcements/{id} {
+      allow read: if isApprovedUser();
+      allow create: if isAdmin()
+        || (isApprovedUser() && currentUserDoc().data.role == 'HOD'
+            && request.resource.data.authorUid == request.auth.uid
+            && request.resource.data.departmentId == currentUserDoc().data.department)
+        || isTeacherOfSubject(request.resource.data.subjectId);
+      allow delete: if isAdmin();
+    }
+
+    match /calendarEvents/{id} {
+      allow read: if isApprovedUser();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Study Material (Phase 11) — a Teacher uploads/deletes files for a
+    // subject they teach; read is open to any approved user (same audience
+    // reasoning as announcements/subjects). No update rule: delete and
+    // re-upload if wrong, same as assignments.
+    match /materials/{id} {
+      allow read: if isApprovedUser();
+      allow create: if isAdmin() || isTeacherOfSubject(request.resource.data.subjectId);
+      allow delete: if isAdmin() || isTeacherOfSubject(resource.data.subjectId);
+    }
+
+    // Exam Result Management — one doc per (subject, student), like
+    // submissions/quizAttempts, but with THREE writers over its lifetime
+    // instead of two: a Teacher owns content while DRAFT/REJECTED and drives
+    // DRAFT/REJECTED -> PENDING_APPROVAL; only an HOD can resolve
+    // PENDING_APPROVAL into APPROVED/REJECTED (a Teacher can never
+    // self-approve). affectedKeys() keeps each side's update to only their
+    // own fields, mirroring submissions' split.
+    //
+    // departmentId is denormalized directly onto the doc (like attendance)
+    // rather than requiring a cross-doc subjectId->department lookup, so the
+    // HOD's department-wide "pending approvals" list query is provably safe
+    // under Firestore's list-rule requirements (isHodOfDepartment reads
+    // resource.data.departmentId directly, matching the query's own
+    // whereEqualTo("departmentId", ...) filter).
+    match /examResults/{resultId} {
+      allow read: if isAdmin()
+        || (isApprovedUser() && resource.data.studentUid == request.auth.uid
+            && resource.data.status == 'APPROVED')
+        || isTeacherOfSubject(resource.data.subjectId)
+        || isHodOfDepartment(resource.data.departmentId);
+
+      // A fresh result row always starts life as DRAFT, authored by the
+      // subject's own Teacher, with no grade/gpaPoint/review fields set yet.
+      allow create: if isAdmin()
+        || (isTeacherOfSubject(request.resource.data.subjectId)
+            && request.resource.data.teacherUid == request.auth.uid
+            && request.resource.data.status == 'DRAFT'
+            && request.resource.data.grade == null
+            && request.resource.data.gpaPoint == null
+            && request.resource.data.reviewedBy == null);
+
+      allow update: if isAdmin()
+        || (isTeacherOfSubject(resource.data.subjectId)
+            && resource.data.status in ['DRAFT', 'REJECTED']
+            && request.resource.data.status in ['DRAFT', 'PENDING_APPROVAL']
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['obtainedMarks', 'totalMarks', 'status', 'submittedAt', 'rejectionReason', 'updatedAt']))
+        || (isHodOfSubjectDepartment(resource.data.subjectId)
+            && resource.data.status == 'PENDING_APPROVAL'
+            && request.resource.data.status in ['APPROVED', 'REJECTED']
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['status', 'grade', 'gpaPoint', 'reviewedBy', 'reviewedAt', 'rejectionReason']));
+
+      allow delete: if isAdmin();
+    }
+  }
+}

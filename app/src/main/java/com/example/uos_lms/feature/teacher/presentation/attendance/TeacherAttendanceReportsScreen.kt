@@ -1,0 +1,184 @@
+package com.example.uos_lms.feature.teacher.presentation.attendance
+
+import android.content.Intent
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.hilt.navigation.compose.hiltViewModel
+import com.example.uos_lms.core.common.dateKeyToDisplay
+import com.example.uos_lms.core.domain.model.AttendanceStatus
+import com.example.uos_lms.core.domain.model.UserRole
+import com.example.uos_lms.core.ui.components.EmptyState
+import com.example.uos_lms.core.ui.components.GradientTopAppBar
+import com.example.uos_lms.core.ui.components.SelectDialog
+import com.example.uos_lms.feature.teacher.presentation.components.TeacherBottomNavBar
+import com.example.uos_lms.feature.teacher.presentation.components.TeacherTab
+import com.example.uos_lms.ui.theme.roleGradientColors
+
+@Composable
+fun TeacherAttendanceReportsScreen(
+    onHomeClick: () -> Unit,
+    onStudentsClick: () -> Unit,
+    onReportsClick: () -> Unit,
+    onAnnouncementsClick: () -> Unit,
+    onProfileClick: () -> Unit,
+    viewModel: TeacherAttendanceReportsViewModel = hiltViewModel(),
+) {
+    val uiState by viewModel.uiState.collectAsState()
+    val context = LocalContext.current
+    var showSubjectPicker by remember { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            GradientTopAppBar(
+                title = "Attendance Reports",
+                gradient = Brush.horizontalGradient(roleGradientColors(UserRole.TEACHER).toList()),
+            )
+        },
+        bottomBar = {
+            TeacherBottomNavBar(
+                selected = TeacherTab.ATTENDANCE,
+                onHomeClick = onHomeClick,
+                onStudentsClick = onStudentsClick,
+                onAttendanceClick = {},
+                onReportsClick = onReportsClick,
+                onAnnouncementsClick = onAnnouncementsClick,
+                onProfileClick = onProfileClick,
+            )
+        },
+        floatingActionButton = {
+            if (uiState.records.isNotEmpty()) {
+                FloatingActionButton(
+                    onClick = {
+                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_SUBJECT, "Attendance Report")
+                            putExtra(Intent.EXTRA_TEXT, viewModel.buildCsv())
+                        }
+                        context.startActivity(Intent.createChooser(shareIntent, "Export Attendance"))
+                    },
+                ) {
+                    Icon(Icons.Default.Share, contentDescription = "Export CSV")
+                }
+            }
+        },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding),
+        ) {
+            Row(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                FilterChip(
+                    selected = uiState.selectedSubject != null,
+                    onClick = { showSubjectPicker = true },
+                    label = { Text(uiState.selectedSubject?.let { "${it.code} • ${it.title}" } ?: "All Subjects") },
+                )
+            }
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        "${uiState.percentage}% present",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    )
+                    Text(
+                        "${uiState.presentCount} / ${uiState.records.size} records",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    )
+                }
+            }
+
+            if (uiState.records.isEmpty() && !uiState.isLoading) {
+                EmptyState(message = "No attendance recorded yet.", modifier = Modifier.fillMaxSize())
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(uiState.records, key = { it.id }) { record ->
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .animateItem(),
+                            shape = RoundedCornerShape(14.dp),
+                            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Column {
+                                    Text(record.studentName, style = MaterialTheme.typography.titleSmall)
+                                    Text(dateKeyToDisplay(record.dateKey), style = MaterialTheme.typography.bodySmall)
+                                }
+                                Text(
+                                    if (record.status == AttendanceStatus.PRESENT) "Present" else "Absent",
+                                    color = if (record.status == AttendanceStatus.PRESENT) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.error
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showSubjectPicker) {
+        SelectDialog(
+            title = "Filter by Subject",
+            options = uiState.subjects,
+            itemLabel = { "${it.code} • ${it.title}" },
+            onSelect = { subject ->
+                viewModel.onSubjectSelected(subject)
+                showSubjectPicker = false
+            },
+            onDismiss = { showSubjectPicker = false },
+            emptyMessage = "You have no assigned subjects yet.",
+        )
+    }
+}

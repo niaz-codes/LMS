@@ -1,0 +1,18 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // All file/image uploads (profile photos, assignments, submissions,
+    // study materials) now go through Cloudinary — see
+    // core/data/remote/CloudinaryDataSource.kt. Firebase Storage is no
+    // longer used by the app, so everything is denied by default.
+    //
+    // Deploy this to the Firebase Console to close off the old
+    // profile_photos/, assignment_submissions/, materials/, and
+    // assignments/ paths from Phases 1/7/11/12. Any files already sitting
+    // in those paths are orphaned and can be deleted from the Storage
+    // bucket once you've confirmed the Cloudinary migration is working.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
