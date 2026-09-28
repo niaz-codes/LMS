@@ -129,6 +129,15 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/subjects/$(subjectId)).data.departmentId == currentUserDoc().data.department;
     }
 
+    // Leave Application (Phase: Leave Application) - a Teacher may belong to several
+    // departments via departmentIds, same multi-department reasoning as the /users/{userId}
+    // read rule above.
+    function isTeacherInDepartment(departmentId) {
+      return isApprovedUser() && currentUserDoc().data.role == 'TEACHER'
+        && (currentUserDoc().data.department == departmentId
+            || departmentId in currentUserDoc().data.get('departmentIds', []));
+    }
+
     // Personal data: unlike departments/semesters/subjects, NOT open to any
     // approved user. A Student may only ever read their own records; a
     // Teacher may only read/write records for subjects they are actually
@@ -289,6 +298,148 @@ service cloud.firestore {
                  .hasOnly(['status', 'grade', 'gpaPoint', 'reviewedBy', 'reviewedAt', 'rejectionReason']));
 
       allow delete: if isAdmin();
+    }
+
+    // Student Semester Promotion - one immutable audit doc per (student, fromSemester),
+    // id = "{studentUid}_{fromSemesterId}" (see FirestorePromotionDataSource). Only Admin
+    // performs promotions; a student may read their own history. No update/delete rule is
+    // written on purpose - a promotion record is a permanent fact once created, same
+    // "immutable audit log" reasoning as quizAttempts having no update rule for its own
+    // finality guarantee.
+    match /promotions/{id} {
+      allow read: if isAdmin() || (isApprovedUser() && resource.data.studentUid == request.auth.uid);
+      allow create: if isAdmin();
+    }
+
+    // Leave Application - a Student applies (PENDING, no reviewer yet); Admin, the student's
+    // own HOD, or any Teacher in the student's department may decide it - first responder wins,
+    // enforced by requiring resource.data.status == 'PENDING' on the way in and the decider to
+    // record themselves as reviewerUid. affectedKeys() keeps a decider's update to only the
+    // reviewer-decision fields, mirroring examResults' HOD-approval split. departmentId is
+    // denormalized directly onto the doc (like attendance/examResults) so the Teacher/HOD
+    // department-wide pending-queue queries are provably safe under Firestore's list-rule
+    // requirements.
+    match /leaveApplications/{leaveId} {
+      allow read: if isAdmin()
+        || (isApprovedUser() && resource.data.studentUid == request.auth.uid)
+        || isHodOfDepartment(resource.data.departmentId)
+        || isTeacherInDepartment(resource.data.departmentId);
+
+      allow create: if isApprovedUser() && currentUserDoc().data.role == 'STUDENT'
+        && request.resource.data.studentUid == request.auth.uid
+        && request.resource.data.status == 'PENDING'
+        && request.resource.data.reviewerUid == null;
+
+      allow update: if isAdmin()
+        || ((isHodOfDepartment(resource.data.departmentId) || isTeacherInDepartment(resource.data.departmentId))
+            && resource.data.status == 'PENDING'
+            && request.resource.data.status in ['APPROVED', 'REJECTED']
+            && request.resource.data.reviewerUid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['status', 'reviewerUid', 'reviewerName', 'reviewerRole', 'decidedAt']));
+
+      allow delete: if isAdmin();
+    }
+
+    // Timetable (Phase: Timetable) - weekly recurring class schedule, reference-collection shape
+    // like departments/semesters/subjects (read open to any approved user, write Admin-only).
+    // Teacher/room clash detection lives entirely client-side in
+    // FirestoreTimetableDataSource.createSlot()'s transaction against the two index
+    // collections below - those are internal invariant-guard docs, never rendered, so they're
+    // locked to Admin only (matching how the write path that populates them is Admin-only too).
+    match /timetableSlots/{slotId} {
+      allow read: if isApprovedUser();
+      allow write: if isAdmin();
+    }
+
+    match /timetableTeacherIndex/{indexId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /timetableRoomIndex/{indexId} {
+      allow read, write: if isAdmin();
+    }
+
+    // Exam Scheduling (Phase: Exam Scheduling) - deliberately separate from examResults: this
+    // is WHEN/WHERE an exam happens (before any marks exist), not the marks themselves.
+    // Admin-only create/publish/lock (no HOD-approval state machine here, to avoid a confusing
+    // near-duplicate of examResults' own DRAFT->PENDING_APPROVAL->APPROVED workflow) - HOD gets
+    // full department read for monitoring instead. A Student only ever sees PUBLISHED/LOCKED
+    // exams for their own department+semester; the client queries a single status value at a
+    // time (never combining them via whereIn), so this "status in [...]" condition is provably
+    // satisfied by each such query, same reasoning as examResults' status == 'APPROVED' check.
+    match /examSchedules/{scheduleId} {
+      allow read: if isAdmin()
+        || isHodOfDepartment(resource.data.departmentId)
+        || isTeacherOfSubject(resource.data.subjectId)
+        || (isApprovedUser() && resource.data.invigilatorUid == request.auth.uid)
+        || (isApprovedUser() && currentUserDoc().data.role == 'STUDENT'
+            && currentUserDoc().data.department == resource.data.departmentId
+            && currentUserDoc().data.semester == resource.data.semesterId
+            && resource.data.status in ['PUBLISHED', 'LOCKED']);
+
+      allow write: if isAdmin();
+    }
+
+    match /examTeacherIndex/{indexId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /examRoomIndex/{indexId} {
+      allow read, write: if isAdmin();
+    }
+
+    // Private Messaging (Phase: Private Messaging) - restricted to adjacent role pairs only
+    // (Student<->Teacher, Teacher<->HOD, HOD<->Admin), enforced here independently of the
+    // client's own contact-picker filtering by re-reading each participant's ACTUAL stored
+    // role - the denormalized participantARole/participantBRole fields on the doc are for
+    // display only and are never trusted for this check.
+    function isValidMessagingPair(roleA, roleB) {
+      return (roleA == 'STUDENT' && roleB == 'TEACHER') || (roleA == 'TEACHER' && roleB == 'STUDENT')
+          || (roleA == 'TEACHER' && roleB == 'HOD') || (roleA == 'HOD' && roleB == 'TEACHER')
+          || (roleA == 'HOD' && roleB == 'ADMIN') || (roleA == 'ADMIN' && roleB == 'HOD');
+    }
+
+    // conversations' doc ID is a deterministic sortedUidA_sortedUidB pairing key (same
+    // "find or create" idempotency idiom as examResults' subjectId_studentUid) - at most one
+    // thread ever exists per pair. Either participant may update metadata fields (unread
+    // counts, last-message preview) since both sides legitimately touch these when sending or
+    // reading; only identity fields (participant uids/names/roles) are permanently locked
+    // after create.
+    match /conversations/{conversationId} {
+      allow read: if isAdmin()
+        || (isApprovedUser() && (resource.data.participantAUid == request.auth.uid || resource.data.participantBUid == request.auth.uid));
+
+      allow create: if isApprovedUser()
+        && (request.resource.data.participantAUid == request.auth.uid || request.resource.data.participantBUid == request.auth.uid)
+        && isValidMessagingPair(
+             get(/databases/$(database)/documents/users/$(request.resource.data.participantAUid)).data.role,
+             get(/databases/$(database)/documents/users/$(request.resource.data.participantBUid)).data.role);
+
+      allow update: if isAdmin()
+        || (isApprovedUser() && (resource.data.participantAUid == request.auth.uid || resource.data.participantBUid == request.auth.uid)
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['lastMessageText', 'lastMessageSenderUid', 'lastMessageAt', 'unreadCountA', 'unreadCountB',
+                           'archivedByA', 'archivedByB', 'deletedByA', 'deletedByB']));
+    }
+
+    function isConversationParticipant(conversationId) {
+      return isApprovedUser()
+        && (get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantAUid == request.auth.uid
+            || get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantBUid == request.auth.uid);
+    }
+
+    // messages is top-level with a denormalized conversationId (not a subcollection), matching
+    // every other collection in this app - see FirestoreMessagingDataSource for the query shape.
+    match /messages/{messageId} {
+      allow read: if isAdmin() || isConversationParticipant(resource.data.conversationId);
+
+      allow create: if isConversationParticipant(request.resource.data.conversationId)
+        && request.resource.data.senderUid == request.auth.uid;
+
+      allow update: if isAdmin()
+        || (isConversationParticipant(resource.data.conversationId)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readAt']));
     }
   }
 }
