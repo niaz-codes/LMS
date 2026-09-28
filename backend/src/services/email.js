@@ -12,7 +12,6 @@ function getTransporter() {
         ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
         : undefined,
       connectionOptions: { family: 4 },
-      tls: { rejectUnauthorized: false },
       connectionTimeout: 20000,
       greetingTimeout: 20000,
       socketTimeout: 30000,
