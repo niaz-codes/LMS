@@ -1,11 +1,36 @@
+# Dependencies
+node_modules/
+
+# Build output
+build/
+app/build/
+.gradle/
+
+# Secrets and credentials - never commit these
 .env
 .env.*
 !.env.example
-node_modules/
-.idea/
-.gradle/
-build/
-app/build/
+*credentials*.env
+*service-account*.json
+*service_account*.json
+firebase-service-account*.json
+*.jks
+*.keystore
+*.p12
+*.pem
 local.properties
+
+# Logs
 *.log
+
+# Editor / IDE
+.idea/
+*.iml
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backups
 *.bak

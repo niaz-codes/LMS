@@ -1,6 +1,15 @@
 const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 
 let transporter = null;
+let resendClient = null;
+
+function getResend() {
+  if (!resendClient) {
+    resendClient = new Resend(process.env.RESEND_API_KEY);
+  }
+  return resendClient;
+}
 
 function getTransporter() {
   if (!transporter) {
@@ -11,38 +20,42 @@ function getTransporter() {
       auth: process.env.SMTP_USER
         ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
         : undefined,
-      connectionOptions: { family: 4 },
-      connectionTimeout: 20000,
-      greetingTimeout: 20000,
-      socketTimeout: 30000,
+      connectionTimeout: 15000,
+      greetingTimeout: 15000,
+      socketTimeout: 25000,
     });
   }
   return transporter;
 }
 
 async function sendMail({ to, subject, text, html }) {
-  if (!process.env.SMTP_HOST) {
-    throw new Error('SMTP_HOST is not configured - cannot send email');
-  }
-  try {
-    await getTransporter().sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+  // Resend talks HTTPS, so it works from hosts whose outbound SMTP ports are blocked
+  // (Railway). Nodemailer stays as the fallback for local/dev SMTP.
+  if (process.env.RESEND_API_KEY) {
+    const { data, error } = await getResend().emails.send({
+      from: process.env.MAIL_FROM || 'onboarding@resend.dev',
       to,
       subject,
       text,
       html,
     });
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error('SMTP sendMail failed:', {
-      code: err.code,
-      address: err.address,
-      command: err.command,
-      response: err.response,
-      message: err.message,
-    });
-    throw err;
+    if (error) {
+      throw new Error(`Resend send failed: ${error.message}`);
+    }
+    return { id: data.id };
   }
+
+  if (!process.env.SMTP_HOST) {
+    throw new Error('Neither RESEND_API_KEY nor SMTP_HOST is configured - cannot send email');
+  }
+  await getTransporter().sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to,
+    subject,
+    text,
+    html,
+  });
+  return {};
 }
 
 module.exports = { sendMail };
