@@ -107,13 +107,34 @@ const registerFcmToken = asyncHandler(async (req, res) => {
   if (!looksLikeFcmToken(token)) {
     throw new ApiError(400, 'Malformed FCM registration token');
   }
-  // $addToSet (not $push) so re-registering the same device stays a no-op - login and every
-  // session start both register, so this runs often. $slice caps the array. $addToSet still
-  // deduplicates against elements already present when combined with $each, so the two goals
-  // don't fight each other.
+  // $addToSet cannot be combined with $slice - only $push accepts that modifier, and Mongo
+  // rejects the combination ("Found unexpected fields after $each in $addToSet"). An
+  // aggregation pipeline does both in one atomic update instead: drop any earlier copy of this
+  // token, append it as the newest entry, then keep only the last MAX_FCM_TOKENS_PER_USER.
   await User.updateOne(
     { _id: req.user._id },
-    { $addToSet: { fcmTokens: { $each: [token], $slice: -MAX_FCM_TOKENS_PER_USER } } }
+    [
+      {
+        $set: {
+          fcmTokens: {
+            $slice: [
+              {
+                $concatArrays: [
+                  {
+                    $filter: {
+                      input: { $ifNull: ['$fcmTokens', []] },
+                      cond: { $ne: ['$$this', token] },
+                    },
+                  },
+                  [token],
+                ],
+              },
+              -MAX_FCM_TOKENS_PER_USER,
+            ],
+          },
+        },
+      },
+    ]
   );
   console.log(`[PUSH] TOKEN-REGISTERED user=${req.user._id} token=${token.slice(0, 12)}...`);
   res.status(204).send();
