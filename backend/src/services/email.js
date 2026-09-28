@@ -11,9 +11,10 @@ function getTransporter() {
       auth: process.env.SMTP_USER
         ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
         : undefined,
-      connectionTimeout: 10000,
-      greetingTimeout: 10000,
-      socketTimeout: 20000,
+      connectionOptions: { family: 4 },
+      connectionTimeout: 15000,
+      greetingTimeout: 15000,
+      socketTimeout: 25000,
     });
   }
   return transporter;
@@ -23,13 +24,25 @@ async function sendMail({ to, subject, text, html }) {
   if (!process.env.SMTP_HOST) {
     throw new Error('SMTP_HOST is not configured - cannot send email');
   }
-  await getTransporter().sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
-    to,
-    subject,
-    text,
-    html,
-  });
+  try {
+    await getTransporter().sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to,
+      subject,
+      text,
+      html,
+    });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('SMTP sendMail failed:', {
+      code: err.code,
+      address: err.address,
+      command: err.command,
+      response: err.response,
+      message: err.message,
+    });
+    throw err;
+  }
 }
 
 module.exports = { sendMail };
