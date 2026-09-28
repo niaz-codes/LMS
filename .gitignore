@@ -1,4 +1,5 @@
 .env
+<<<<<<< HEAD
 .env.*
 !.env.example
 node_modules/
@@ -9,3 +10,12 @@ app/build/
 local.properties
 *.log
 *.bak
+=======
+node_modules/
+.env
+node_modules/
+.env
+.env.*
+!.env.example
+node_modules/
+>>>>>>> 4131462ae443bdd2243283e51e3c35fec69a9a17
