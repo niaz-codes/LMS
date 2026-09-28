@@ -54,7 +54,11 @@ const save = asyncHandler(async (req, res) => {
         title: `Marked absent: ${subject && (subject.title || subject.code) ? (subject.title || subject.code) : ''}`,
         body: dateKey,
         actorId: req.user._id.toString(),
-        relatedType: 'attendanceRecord',
+        // relatedId here is the *subject* id a student is marked absent for, not the per-student
+        // attendance record (there is one record per absent student, and notifyUsers fans out a
+        // single payload to all of them), so the type has to say subject or routing would try to
+        // treat that id as an attendance record.
+        relatedType: 'subject',
         relatedId: subjectId,
       });
     });
